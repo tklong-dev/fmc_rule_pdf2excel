@@ -123,6 +123,18 @@ class LoadingBar:
         sys.stdout.flush()
 
 
+# Referenced Objects sheet columns
+OBJ_GROUP_COLUMNS = ["Policy", "Group Name", "Members"]
+NETWORK_COLUMNS   = ["Policy", "Network Name", "Value"]
+
+# Pattern for entries where name and value share one text box (very long names)
+_EMBEDDED_NET_PATTERN = re.compile(r'^(.+?)\s+(\d[\d./:|-]+)$')
+
+# Height thresholds (in PDF points) to distinguish element types
+_MAIN_SECTION_MIN_HEIGHT = 12   # main section headers  ~13.8 pt
+_SUBSECTION_MIN_HEIGHT   = 10   # subsection headers    ~11.5 pt
+                                 # data items            ~8.0 pt
+
 FIELD_NAMES = [
     "Action",
     "Source Zones",
@@ -257,6 +269,65 @@ def parse_pdf(pdf_path: Path):
     return rules
 
 
+def parse_referenced_objects(pdf_path: Path):
+    """
+    Parse the 'Referenced Objects' section of a Firepower policy PDF.
+    Returns (object_groups, networks), each a list of dicts.
+    """
+    policy_name = pdf_path.stem
+    object_groups = []
+    networks = []
+    in_section = False
+    subsection = None
+
+    for page_layout in extract_pages(str(pdf_path)):
+        elements = extract_page_elements(page_layout)
+        left_elements  = [(x0, y0, y1, t) for x0, y0, y1, t in elements if x0 < LABEL_X_MAX]
+        right_elements = [(x0, y0, y1, t) for x0, y0, y1, t in elements if x0 >= LABEL_X_MAX]
+        left_elements.sort(key=lambda e: -e[2])
+
+        for x0, y0, y1, text in left_elements:
+            height = y1 - y0
+
+            # Main section header (x0≈18, height≈13.8)
+            if x0 < 19 and height > _MAIN_SECTION_MIN_HEIGHT:
+                in_section = (text == "Referenced Objects")
+                subsection = None
+                continue
+
+            if not in_section:
+                continue
+
+            # Subsection header within Referenced Objects (x0≈18, height≈11.5)
+            if x0 < 19 and height > _SUBSECTION_MIN_HEIGHT:
+                subsection = text
+                continue
+
+            # Data item
+            if subsection == "Object Groups":
+                value = find_value_for_label(y0, right_elements)
+                object_groups.append({
+                    "Policy":     policy_name,
+                    "Group Name": text,
+                    "Members":    value,
+                })
+
+            elif subsection == "Network":
+                value = find_value_for_label(y0, right_elements)
+                if not value:
+                    # Long names occasionally absorb their value into the same text box
+                    m = _EMBEDDED_NET_PATTERN.match(text)
+                    if m:
+                        text, value = m.group(1), m.group(2)
+                networks.append({
+                    "Policy":       policy_name,
+                    "Network Name": text,
+                    "Value":        value,
+                })
+
+    return object_groups, networks
+
+
 def apply_header_style(ws, header_row=1):
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF", size=10)
@@ -366,6 +437,47 @@ def write_sheet(wb, sheet_name, rules):
     return ws
 
 
+def write_simple_sheet(wb, sheet_name, columns, rows):
+    """Write a plain two-tone sheet (no action-based row colouring)."""
+    ws = wb.create_sheet(title=sheet_name[:31])
+
+    thin_h = Side(style="thin", color="AAAAAA")
+    thin_d = Side(style="thin", color="DDDDDD")
+    border_h = Border(left=thin_h, right=thin_h, top=thin_h, bottom=thin_h)
+    border_d = Border(left=thin_d, right=thin_d, top=thin_d, bottom=thin_d)
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+
+    for col_idx, col_name in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.fill      = header_fill
+        cell.font      = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = border_h
+
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=row.get(col_name, ""))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border    = border_d
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}1"
+
+    width_map = {
+        "Policy":       20,
+        "Group Name":   35,
+        "Members":      45,
+        "Network Name": 40,
+        "Value":        25,
+    }
+    for col_idx, col_name in enumerate(columns, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width_map.get(col_name, 20)
+
+    return ws
+
+
 def main():
     script_dir = Path(__file__).parent
     input_dir = script_dir / "input"
@@ -394,12 +506,19 @@ def main():
         print(f"\nParsing: {pdf_path.name}")
         with LoadingBar(pdf_path.name):
             rules = parse_pdf(pdf_path)
-        print(f"  -> {len(rules)} rules extracted")
+            object_groups, networks = parse_referenced_objects(pdf_path)
+
         total_rules += len(rules)
+        print(f"  -> {len(rules)} rules, {len(object_groups)} object groups, "
+              f"{len(networks)} network objects extracted")
 
         wb = Workbook()
         wb.remove(wb.active)
         write_sheet(wb, pdf_path.stem, rules)
+        if object_groups:
+            write_simple_sheet(wb, "Object Groups", OBJ_GROUP_COLUMNS, object_groups)
+        if networks:
+            write_simple_sheet(wb, "Network", NETWORK_COLUMNS, networks)
 
         output_path = output_dir / f"{pdf_path.stem}.xlsx"
         wb.save(str(output_path))
